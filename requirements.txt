@@ -1,0 +1,12 @@
+pydantic>=2.6
+pydantic-settings>=2.2
+aiohttp>=3.9
+tenacity>=8.2
+loguru>=0.7
+apprise>=1.8
+akshare>=1.12
+tushare>=1.4
+pandas>=2.0
+python-dotenv>=1.0
+pytest>=8.0
+jqdatasdk>=1.9

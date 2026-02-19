@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+"""CLI argument and execution contract tests."""
+
+from datetime import date, datetime
+from typing import Any
+
+from src.backtest_cli import run_cli
+from src.config import get_settings
+
+
+class FakeProvider:
+    def __init__(self, bars: list[dict[str, Any]]) -> None:
+        self.bars = bars
+
+    def fetch_intraday_minutes(self, code: str, trade_date: date) -> list[dict[str, Any]]:
+        return self.bars
+
+
+class ErrorProvider:
+    def fetch_intraday_minutes(self, code: str, trade_date: date) -> list[dict[str, Any]]:
+        raise RuntimeError("network down")
+
+
+def _seed_required_env(monkeypatch) -> None:
+    monkeypatch.setenv("TUSHARE_TOKEN", "token")
+    monkeypatch.setenv("DINGTALK_URL", "https://oapi.dingtalk.com/robot/send?access_token=dummy")
+    monkeypatch.setenv("JQ_USERNAME", "jq_user")
+    monkeypatch.setenv("JQ_PASSWORD", "jq_password")
+    get_settings.cache_clear()
+
+
+def test_cli_triggered(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+
+    def provider_factory(
+        source: str,
+        username: str | None,
+        password: str | None,
+        askv1_field: str,
+        allow_proxy_fallback: bool,
+    ):
+        assert source == "joinquant"
+        assert username == "jq_user"
+        assert password == "jq_password"
+        assert askv1_field == "volume"
+        assert allow_proxy_fallback is True
+        return FakeProvider(
+            [
+                {
+                    "ts": datetime(2025, 1, 10, 14, 0),
+                    "close": 10.0,
+                    "high": 10.0,
+                    "limit_down_price": 10.0,
+                    "ask_v1": 1000,
+                    "volume": 100,
+                },
+                {
+                    "ts": datetime(2025, 1, 10, 14, 1),
+                    "close": 10.0,
+                    "high": 10.0,
+                    "limit_down_price": 10.0,
+                    "ask_v1": 400,
+                    "volume": 220,
+                },
+                {
+                    "ts": datetime(2025, 1, 10, 14, 2),
+                    "close": 10.0,
+                    "high": 10.0,
+                    "limit_down_price": 10.0,
+                    "ask_v1": 150,
+                    "volume": 500,
+                },
+            ]
+        )
+
+    rc = run_cli(
+        ["--date", "2025-01-10", "--code", "600000", "--source", "joinquant", "--signal-combination", "or"],
+        provider_factory=provider_factory,
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== Gutao_Chaodi Backtest Precheck ===" in out
+    assert "jq_code: 600000.XSHG" in out
+    assert "signal_combination: or" in out
+    assert "confirm_minutes: 1" in out
+    assert "window: 13:00-15:00" in out
+    assert "triggered: YES" in out
+    assert "reason: volume_spike_and_sell1_drop" in out
+    assert "prev_window_ts: 2025-01-10 14:00:00" in out
+    assert "data_quality: minute_proxy" in out
+    assert "samples_in_window: 3" in out
+
+
+def test_cli_invalid_date(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+    rc = run_cli(["--date", "20250110", "--code", "600000"], provider_factory=lambda *_: FakeProvider([]))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "invalid --date" in out
+
+
+def test_cli_invalid_code(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+    rc = run_cli(
+        ["--date", "2025-01-10", "--code", "6000", "--signal-combination", "or"],
+        provider_factory=lambda *_: FakeProvider([]),
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "invalid --code" in out
+
+
+def test_cli_invalid_confirm_minutes(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+    rc = run_cli(
+        ["--date", "2025-01-10", "--code", "600000", "--confirm-minutes", "0"],
+        provider_factory=lambda *_: FakeProvider([]),
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "confirm_minutes must be a positive integer" in out
+
+
+def test_cli_invalid_window(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+    rc = run_cli(
+        ["--date", "2025-01-10", "--code", "600000", "--window-start", "xx:yy", "--signal-combination", "or"],
+        provider_factory=lambda *_: FakeProvider([]),
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "invalid window" in out
+
+
+def test_cli_execution_error(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+    rc = run_cli(
+        ["--date", "2025-01-10", "--code", "600000", "--source", "joinquant", "--signal-combination", "or"],
+        provider_factory=lambda *_: ErrorProvider(),
+    )
+    out = capsys.readouterr().out
+    assert rc == 3
+    assert "backtest execution failed" in out
+
+
+def test_cli_rejects_volume_and_conflict(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+    rc = run_cli(
+        ["--date", "2025-01-10", "--code", "600000", "--signal-combination", "and"],
+        provider_factory=lambda *_: FakeProvider([]),
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "invalid config: askv1_field=volume" in out
+
+
+def test_cli_proxy_mode_strict_disables_fallback(monkeypatch, capsys) -> None:
+    _seed_required_env(monkeypatch)
+
+    def provider_factory(
+        source: str,
+        username: str | None,
+        password: str | None,
+        askv1_field: str,
+        allow_proxy_fallback: bool,
+    ):
+        assert source == "joinquant"
+        assert askv1_field == "a1_v"
+        assert allow_proxy_fallback is False
+        return FakeProvider([])
+
+    rc = run_cli(
+        [
+            "--date",
+            "2025-01-10",
+            "--code",
+            "600000",
+            "--source",
+            "joinquant",
+            "--askv1-field",
+            "a1_v",
+            "--proxy-mode",
+            "strict",
+            "--signal-combination",
+            "and",
+        ],
+        provider_factory=provider_factory,
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "proxy_mode: strict" in out
