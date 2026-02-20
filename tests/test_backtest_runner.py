@@ -16,62 +16,94 @@ class FakeProvider:
         return self.bars
 
 
-def test_run_single_day_backtest_triggered_after_confirm() -> None:
+def test_run_single_day_backtest_triggered_by_buy_flow_breakout() -> None:
     bars = [
         {
-            "ts": datetime(2025, 1, 10, 14, 0),
+            "ts": datetime(2025, 1, 10, 9, 31),
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 1000,
             "volume": 100,
-            "data_quality": "minute_proxy",
         },
         {
-            "ts": datetime(2025, 1, 10, 14, 1),
+            "ts": datetime(2025, 1, 10, 9, 32),
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 600,
             "volume": 200,
-            "data_quality": "minute_proxy",
         },
         {
-            "ts": datetime(2025, 1, 10, 14, 2),
+            "ts": datetime(2025, 1, 10, 13, 1),
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 300,
-            "volume": 500,
-            "data_quality": "minute_proxy",
+            "volume": 50,
+        },
+        {
+            "ts": datetime(2025, 1, 10, 13, 2),
+            "close": 10.0,
+            "high": 10.0,
+            "limit_down_price": 10.0,
+            "volume": 400,
         },
     ]
     result = run_single_day_backtest(
         request=BacktestRequest(
             code="600000",
             trade_date=date(2025, 1, 10),
-            ask_drop_threshold=0.3,
-            volume_spike_threshold=0.5,
-            confirm_minutes=2,
-            signal_combination="and",
         ),
         provider=FakeProvider(bars),
     )
     assert result.triggered is True
-    assert result.reason == "volume_spike_and_sell1_drop"
-    assert result.prev_window_ts == datetime(2025, 1, 10, 14, 1)
-    assert result.curr_window_ts == datetime(2025, 1, 10, 14, 2)
-    assert result.prev_ask_v1 == 600
-    assert result.curr_ask_v1 == 300
-    assert result.prev_volume == 200
-    assert result.curr_volume == 500
-    assert result.signal_ask_drop is True
-    assert result.signal_volume_spike is True
+    assert result.reason == "buy_flow_breakout"
+    assert result.trigger_time == datetime(2025, 1, 10, 13, 2)
+    assert result.current_buy_volume == 400
+    assert result.cumulative_buy_volume_before == 350
     assert result.data_quality == "minute_proxy"
     assert result.confidence == "low"
-    assert result.trigger_time == datetime(2025, 1, 10, 14, 2)
-    assert result.samples == 3
-    assert result.samples_in_window == 3
+    assert result.samples == 4
+    assert result.samples_in_window == 2
+    assert result.samples_one_word_in_window == 2
+
+
+def test_run_single_day_backtest_not_triggered_at_1302_for_002122_like_pattern() -> None:
+    bars = [
+        {
+            "ts": datetime(2025, 11, 5, 9, 31),
+            "close": 3.07,
+            "high": 3.07,
+            "limit_down_price": 3.07,
+            "volume": 1_000_000,
+        },
+        {
+            "ts": datetime(2025, 11, 5, 13, 1),
+            "close": 3.07,
+            "high": 3.07,
+            "limit_down_price": 3.07,
+            "volume": 498_300,
+        },
+        {
+            "ts": datetime(2025, 11, 5, 13, 2),
+            "close": 3.07,
+            "high": 3.07,
+            "limit_down_price": 3.07,
+            "volume": 500,
+        },
+        {
+            "ts": datetime(2025, 11, 5, 15, 0),
+            "close": 3.07,
+            "high": 3.07,
+            "limit_down_price": 3.07,
+            "volume": 2_000_000,
+        },
+    ]
+    result = run_single_day_backtest(
+        request=BacktestRequest(code="002122", trade_date=date(2025, 11, 5)),
+        provider=FakeProvider(bars),
+    )
+    assert result.triggered is True
+    # 13:02 should not trigger because volume is much smaller than accumulated history.
+    assert result.trigger_time == datetime(2025, 11, 5, 15, 0)
 
 
 def test_run_single_day_backtest_no_one_word_limit() -> None:
@@ -81,55 +113,45 @@ def test_run_single_day_backtest_no_one_word_limit() -> None:
             "close": 10.1,
             "high": 10.2,
             "limit_down_price": 10.0,
-            "ask_v1": 1000,
             "volume": 1000,
         }
     ]
     result = run_single_day_backtest(
-        request=BacktestRequest(code="600000", trade_date=date(2025, 1, 10), ask_drop_threshold=0.3),
+        request=BacktestRequest(code="600000", trade_date=date(2025, 1, 10)),
         provider=FakeProvider(bars),
     )
     assert result.triggered is False
     assert result.reason == "no_one_word_limit_down"
     assert result.samples_in_window == 1
+    assert result.samples_one_word_in_window == 0
 
 
-def test_run_single_day_backtest_threshold_not_met_when_not_consecutive() -> None:
+def test_run_single_day_backtest_threshold_not_met() -> None:
     bars = [
         {
-            "ts": datetime(2025, 1, 10, 14, 0),
+            "ts": datetime(2025, 1, 10, 9, 31),
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 1000,
+            "volume": 500,
+        },
+        {
+            "ts": datetime(2025, 1, 10, 13, 1),
+            "close": 10.0,
+            "high": 10.0,
+            "limit_down_price": 10.0,
             "volume": 100,
         },
         {
-            "ts": datetime(2025, 1, 10, 14, 1),
+            "ts": datetime(2025, 1, 10, 13, 2),
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 600,
             "volume": 200,
-        },
-        {
-            "ts": datetime(2025, 1, 10, 14, 2),
-            "close": 10.0,
-            "high": 10.0,
-            "limit_down_price": 10.0,
-            "ask_v1": 500,
-            "volume": 220,
         },
     ]
     result = run_single_day_backtest(
-        request=BacktestRequest(
-            code="600000",
-            trade_date=date(2025, 1, 10),
-            ask_drop_threshold=0.3,
-            volume_spike_threshold=0.5,
-            confirm_minutes=2,
-            signal_combination="and",
-        ),
+        request=BacktestRequest(code="600000", trade_date=date(2025, 1, 10)),
         provider=FakeProvider(bars),
     )
     assert result.triggered is False
@@ -143,7 +165,6 @@ def test_run_single_day_backtest_insufficient_data() -> None:
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 1000,
             "volume": 100,
         },
         {
@@ -151,17 +172,15 @@ def test_run_single_day_backtest_insufficient_data() -> None:
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 900,
             "volume": None,
         },
     ]
     result = run_single_day_backtest(
-        request=BacktestRequest(code="600000", trade_date=date(2025, 1, 10), ask_drop_threshold=0.3),
+        request=BacktestRequest(code="600000", trade_date=date(2025, 1, 10)),
         provider=FakeProvider(bars),
     )
     assert result.triggered is False
     assert result.reason == "insufficient_data"
-    assert result.samples_in_window == 2
 
 
 def test_run_single_day_backtest_no_data_in_window() -> None:
@@ -171,7 +190,6 @@ def test_run_single_day_backtest_no_data_in_window() -> None:
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 1000,
             "volume": 100,
         },
         {
@@ -179,74 +197,14 @@ def test_run_single_day_backtest_no_data_in_window() -> None:
             "close": 10.0,
             "high": 10.0,
             "limit_down_price": 10.0,
-            "ask_v1": 600,
             "volume": 120,
         },
     ]
     result = run_single_day_backtest(
-        request=BacktestRequest(code="600000", trade_date=date(2025, 1, 10), ask_drop_threshold=0.3),
+        request=BacktestRequest(code="600000", trade_date=date(2025, 1, 10)),
         provider=FakeProvider(bars),
     )
     assert result.triggered is False
     assert result.reason == "no_data_in_window"
     assert result.samples == 2
     assert result.samples_in_window == 0
-
-
-def test_run_single_day_backtest_ignores_early_drop_without_volume_spike() -> None:
-    bars = [
-        {
-            "ts": datetime(2025, 11, 5, 13, 1),
-            "close": 10.0,
-            "high": 10.0,
-            "limit_down_price": 10.0,
-            "ask_v1": 498300,
-            "volume": 498300,
-        },
-        {
-            "ts": datetime(2025, 11, 5, 13, 2),
-            "close": 10.0,
-            "high": 10.0,
-            "limit_down_price": 10.0,
-            "ask_v1": 10300,
-            "volume": 10300,
-        },
-        {
-            "ts": datetime(2025, 11, 5, 13, 3),
-            "close": 10.0,
-            "high": 10.0,
-            "limit_down_price": 10.0,
-            "ask_v1": 12000,
-            "volume": 12000,
-        },
-        {
-            "ts": datetime(2025, 11, 5, 14, 54),
-            "close": 10.0,
-            "high": 10.0,
-            "limit_down_price": 10.0,
-            "ask_v1": 50000,
-            "volume": 10000,
-        },
-        {
-            "ts": datetime(2025, 11, 5, 14, 55),
-            "close": 10.0,
-            "high": 10.0,
-            "limit_down_price": 10.0,
-            "ask_v1": 10000,
-            "volume": 26000,
-        },
-    ]
-    result = run_single_day_backtest(
-        request=BacktestRequest(
-            code="002122",
-            trade_date=date(2025, 11, 5),
-            ask_drop_threshold=0.3,
-            volume_spike_threshold=0.8,
-            confirm_minutes=1,
-            signal_combination="and",
-        ),
-        provider=FakeProvider(bars),
-    )
-    assert result.triggered is True
-    assert result.trigger_time == datetime(2025, 11, 5, 14, 55)
-    assert result.prev_window_ts == datetime(2025, 11, 5, 14, 54)

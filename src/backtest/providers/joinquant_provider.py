@@ -38,18 +38,6 @@ def _is_permission_or_quota_error(exc: Exception) -> bool:
     )
 
 
-def _dedupe(items: list[str]) -> list[str]:
-    """Keep order while removing duplicates from requested field list."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
-
-
 class JoinQuantMinuteProvider(IntradayMinuteProvider):
     """Fetch minute bars from JoinQuant and normalize for the backtest runner."""
 
@@ -57,14 +45,10 @@ class JoinQuantMinuteProvider(IntradayMinuteProvider):
         self,
         username: str | None,
         password: str | None,
-        ask_v1_field: str = "volume",
-        allow_proxy_fallback: bool = True,
         jq_adapter: JoinQuantAdapter | None = None,
     ) -> None:
         self.username = username
         self.password = password
-        self.ask_v1_field = ask_v1_field
-        self.allow_proxy_fallback = allow_proxy_fallback
         self.jq = jq_adapter or self._import_jq()
         self._authenticated = False
 
@@ -115,7 +99,7 @@ class JoinQuantMinuteProvider(IntradayMinuteProvider):
         jq_code = normalize_code_to_jq(code)
         start_dt = datetime.combine(trade_date, time(9, 30))
         end_dt = datetime.combine(trade_date, time(15, 0))
-        fields = _dedupe(["close", "high", "low_limit", "pre_close", "volume", self.ask_v1_field])
+        fields = ["close", "high", "low_limit", "pre_close", "volume"]
 
         try:
             df = self.jq.get_price(
@@ -137,30 +121,12 @@ class JoinQuantMinuteProvider(IntradayMinuteProvider):
             return []
 
         logger.debug(
-            "joinquant proxy minute columns code={} date={} columns={}",
+            "joinquant minute columns code={} date={} columns={}",
             jq_code,
             trade_date,
             list(df.columns),
         )
-        # data_quality is attached to every row so downstream reports can expose confidence.
-        ask_v1_source = self.ask_v1_field
-        data_quality = "tick_a1v" if self.ask_v1_field.lower() in {"a1_v", "ask_v1"} else "minute_proxy"
-        if self.ask_v1_field not in df.columns:
-            if self.allow_proxy_fallback and "volume" in df.columns:
-                # Graceful degrade: keep replay runnable but mark as low-confidence proxy.
-                ask_v1_source = "volume"
-                data_quality = "minute_proxy"
-                logger.warning(
-                    "joinquant ask_v1 field {} missing for {} on {}, fallback to volume proxy",
-                    self.ask_v1_field,
-                    jq_code,
-                    trade_date,
-                )
-            else:
-                raise ValueError(
-                    f"JoinQuant minute data missing field '{self.ask_v1_field}', "
-                    f"available columns: {list(df.columns)}"
-                )
+
         if "volume" not in df.columns:
             raise ValueError(
                 "JoinQuant minute data missing field 'volume', "
@@ -187,10 +153,8 @@ class JoinQuantMinuteProvider(IntradayMinuteProvider):
                     "close": row.get("close"),
                     "high": row.get("high"),
                     "limit_down_price": limit_down_price,
-                    "ask_v1": row.get(ask_v1_source),
                     "volume": row.get("volume"),
-                    "ask_v1_source": ask_v1_source,
-                    "data_quality": data_quality,
+                    "data_quality": "minute_proxy",
                 }
             )
         return records

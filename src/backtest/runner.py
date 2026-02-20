@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-"""Single-day replay runner that reuses the live strategy engine."""
+"""Single-day replay runner for buy-flow breakout backtest strategy."""
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from typing import Any
 
-from ..engine import StrategyEngine
 from ..models import ConfidenceLevel, DataQuality
-from ..models import PoolStock
-from .mapper import minute_bar_to_snapshot
 from .providers.base import IntradayMinuteProvider
 
 
@@ -19,19 +16,8 @@ class BacktestRequest:
 
     code: str
     trade_date: date
-    ask_drop_threshold: float
-    volume_spike_threshold: float = 0.8
-    confirm_minutes: int = 1
-    signal_combination: str = "and"
-    min_abs_delta_ask: int = 0
-    min_abs_delta_volume: int = 0
     window_start: time = field(default_factory=lambda: time(13, 0))
     window_end: time = field(default_factory=lambda: time(15, 0))
-
-    @property
-    def threshold(self) -> float:
-        """Backward-compatible alias for historical field naming."""
-        return self.ask_drop_threshold
 
 
 @dataclass(frozen=True)
@@ -41,20 +27,13 @@ class BacktestResult:
     triggered: bool
     trigger_time: datetime | None
     reason: str
-    prev_window_ts: datetime | None
-    curr_window_ts: datetime | None
-    prev_ask_v1: int | None
-    curr_ask_v1: int | None
-    ask_change_ratio: float | None
-    prev_volume: int | None
-    curr_volume: int | None
-    volume_change_ratio: float | None
-    signal_ask_drop: bool
-    signal_volume_spike: bool
+    current_buy_volume: int | None
+    cumulative_buy_volume_before: int | None
     data_quality: DataQuality
     confidence: ConfidenceLevel
     samples: int
     samples_in_window: int
+    samples_one_word_in_window: int
 
 
 def _sort_key(bar: dict[str, Any]) -> str:
@@ -73,193 +52,130 @@ def _coerce_ts(value: Any) -> datetime:
     raise ValueError(f"invalid ts value: {value!r}")
 
 
+def _coerce_float(value: Any, field_name: str) -> float:
+    """Coerce numeric-like provider values to float with strict validation."""
+    if value in (None, "", "-"):
+        raise ValueError(f"missing field '{field_name}'")
+    return float(value)
+
+
 def _default_quality() -> tuple[DataQuality, ConfidenceLevel]:
-    """Return conservative defaults for non-triggered/empty states."""
+    """Return conservative defaults for backtest output."""
     return ("minute_proxy", "low")
 
 
-def _quality_to_confidence(data_quality: DataQuality) -> ConfidenceLevel:
-    """Map data quality level to confidence label."""
-    return "high" if data_quality == "tick_a1v" else "low"
+def _is_one_word_limit_down(close: float, high: float, limit_down: float) -> bool:
+    """Identify one-word limit-down minute bars with tolerance for float noise."""
+    eps = 1e-6
+    return abs(close - limit_down) <= eps and abs(high - limit_down) <= eps
 
 
 def run_single_day_backtest(
     request: BacktestRequest,
     provider: IntradayMinuteProvider,
-    engine: StrategyEngine | None = None,
 ) -> BacktestResult:
-    """Replay intraday bars and return whether the strategy would trigger."""
-    # Provider can be tick-based or minute-proxy; runner remains agnostic.
+    """Replay intraday bars and trigger when one-minute buy flow exceeds prior day accumulation."""
     raw_bars = provider.fetch_intraday_minutes(request.code, request.trade_date)
+    data_quality, confidence = _default_quality()
+
     if not raw_bars:
-        data_quality, confidence = _default_quality()
         return BacktestResult(
             triggered=False,
             trigger_time=None,
             reason="no_data",
-            prev_window_ts=None,
-            curr_window_ts=None,
-            prev_ask_v1=None,
-            curr_ask_v1=None,
-            ask_change_ratio=None,
-            prev_volume=None,
-            curr_volume=None,
-            volume_change_ratio=None,
-            signal_ask_drop=False,
-            signal_volume_spike=False,
+            current_buy_volume=None,
+            cumulative_buy_volume_before=None,
             data_quality=data_quality,
             confidence=confidence,
             samples=0,
             samples_in_window=0,
+            samples_one_word_in_window=0,
         )
 
-    # Stable chronological replay guarantees deterministic state transitions.
     ordered_bars = sorted(raw_bars, key=_sort_key)
-    windowed_bars: list[dict[str, Any]] = []
+    samples_in_window = 0
+    samples_one_word_in_window = 0
+    cumulative_buy_volume_day = 0
+
     for bar in ordered_bars:
         try:
             bar_ts = _coerce_ts(bar.get("ts"))
         except ValueError:
-            data_quality, confidence = _default_quality()
             return BacktestResult(
                 triggered=False,
                 trigger_time=None,
                 reason="insufficient_data",
-                prev_window_ts=None,
-                curr_window_ts=None,
-                prev_ask_v1=None,
-                curr_ask_v1=None,
-                ask_change_ratio=None,
-                prev_volume=None,
-                curr_volume=None,
-                volume_change_ratio=None,
-                signal_ask_drop=False,
-                signal_volume_spike=False,
+                current_buy_volume=None,
+                cumulative_buy_volume_before=None,
                 data_quality=data_quality,
                 confidence=confidence,
                 samples=len(raw_bars),
-                samples_in_window=0,
+                samples_in_window=samples_in_window,
+                samples_one_word_in_window=samples_one_word_in_window,
             )
-        # Backtest only evaluates bars inside configured monitoring window.
-        if request.window_start <= bar_ts.time() <= request.window_end:
-            windowed_bars.append(bar)
 
-    if not windowed_bars:
-        data_quality, confidence = _default_quality()
-        return BacktestResult(
-            triggered=False,
-            trigger_time=None,
-            reason="no_data_in_window",
-            prev_window_ts=None,
-            curr_window_ts=None,
-            prev_ask_v1=None,
-            curr_ask_v1=None,
-            ask_change_ratio=None,
-            prev_volume=None,
-            curr_volume=None,
-            volume_change_ratio=None,
-            signal_ask_drop=False,
-            signal_volume_spike=False,
-            data_quality=data_quality,
-            confidence=confidence,
-            samples=len(raw_bars),
-            samples_in_window=0,
-        )
-
-    # StrategyEngine is shared with live path to avoid rule drift.
-    strategy = engine or StrategyEngine(
-        ask_drop_threshold=request.ask_drop_threshold,
-        volume_spike_threshold=request.volume_spike_threshold,
-        confirm_minutes=request.confirm_minutes,
-        signal_combination=request.signal_combination,  # type: ignore[arg-type]
-        min_abs_delta_ask=request.min_abs_delta_ask,
-        min_abs_delta_volume=request.min_abs_delta_volume,
-    )
-    strategy.register_pool(
-        [
-            PoolStock(
-                code=request.code,
-                name=request.code,
-                is_st=False,
-                pool_type="all",
-            )
-        ]
-    )
-
-    has_one_word_snapshot = False
-    for bar in windowed_bars:
         try:
-            # Normalize raw bar into strict strategy contract.
-            snapshot = minute_bar_to_snapshot(bar=bar, code=request.code, name=str(bar.get("name") or request.code))
+            close = _coerce_float(bar.get("close"), "close")
+            high = _coerce_float(bar.get("high"), "high")
+            limit_down_price = _coerce_float(bar.get("limit_down_price"), "limit_down_price")
+            volume = _coerce_float(bar.get("volume"), "volume")
         except ValueError:
-            last_point = strategy.prev_window_map.get(request.code)
-            data_quality = last_point.data_quality if last_point is not None else "minute_proxy"
             return BacktestResult(
                 triggered=False,
                 trigger_time=None,
                 reason="insufficient_data",
-                prev_window_ts=last_point.ts if last_point is not None else None,
-                curr_window_ts=None,
-                prev_ask_v1=last_point.ask_v1 if last_point is not None else None,
-                curr_ask_v1=None,
-                ask_change_ratio=None,
-                prev_volume=last_point.volume if last_point is not None else None,
-                curr_volume=None,
-                volume_change_ratio=None,
-                signal_ask_drop=False,
-                signal_volume_spike=False,
+                current_buy_volume=None,
+                cumulative_buy_volume_before=None,
                 data_quality=data_quality,
-                confidence=_quality_to_confidence(data_quality),
+                confidence=confidence,
                 samples=len(raw_bars),
-                samples_in_window=len(windowed_bars),
+                samples_in_window=samples_in_window,
+                samples_one_word_in_window=samples_one_word_in_window,
             )
 
-        if snapshot.is_one_word_limit_down:
-            has_one_word_snapshot = True
+        is_one_word = _is_one_word_limit_down(close, high, limit_down_price)
+        current_buy_volume = int(max(volume, 0.0)) if is_one_word else 0
+        cumulative_before = cumulative_buy_volume_day
 
-        # Evaluate one bar at a time; state machine decides whether to alert.
-        event = strategy.evaluate(snapshot)
-        if event is None:
-            continue
+        in_window = request.window_start <= bar_ts.time() <= request.window_end
+        if in_window:
+            samples_in_window += 1
+            if is_one_word:
+                samples_one_word_in_window += 1
 
-        return BacktestResult(
-            triggered=True,
-            trigger_time=snapshot.ts,
-            reason=event.reason,
-            prev_window_ts=event.prev_window_ts,
-            curr_window_ts=event.curr_window_ts,
-            prev_ask_v1=event.initial_ask_v1,
-            curr_ask_v1=event.current_ask_v1,
-            ask_change_ratio=event.drop_ratio,
-            prev_volume=event.initial_volume,
-            curr_volume=event.current_volume,
-            volume_change_ratio=event.volume_change_ratio,
-            signal_ask_drop=event.signal_ask_drop,
-            signal_volume_spike=event.signal_volume_spike,
-            data_quality=event.data_quality,
-            confidence=event.confidence,
-            samples=len(raw_bars),
-            samples_in_window=len(windowed_bars),
-        )
+            if is_one_word and cumulative_before > 0 and current_buy_volume > cumulative_before:
+                return BacktestResult(
+                    triggered=True,
+                    trigger_time=bar_ts,
+                    reason="buy_flow_breakout",
+                    current_buy_volume=current_buy_volume,
+                    cumulative_buy_volume_before=cumulative_before,
+                    data_quality=data_quality,
+                    confidence=confidence,
+                    samples=len(raw_bars),
+                    samples_in_window=samples_in_window,
+                    samples_one_word_in_window=samples_one_word_in_window,
+                )
 
-    last_point = strategy.prev_window_map.get(request.code)
-    data_quality = last_point.data_quality if last_point is not None else "minute_proxy"
+        # Full-day accumulation: update after evaluation so trigger compares against history only.
+        cumulative_buy_volume_day += current_buy_volume
+
+    if samples_in_window == 0:
+        reason = "no_data_in_window"
+    elif samples_one_word_in_window == 0:
+        reason = "no_one_word_limit_down"
+    else:
+        reason = "threshold_not_met"
+
     return BacktestResult(
         triggered=False,
         trigger_time=None,
-        reason="no_one_word_limit_down" if not has_one_word_snapshot else "threshold_not_met",
-        prev_window_ts=last_point.ts if last_point is not None else None,
-        curr_window_ts=None,
-        prev_ask_v1=last_point.ask_v1 if last_point is not None else None,
-        curr_ask_v1=None,
-        ask_change_ratio=None,
-        prev_volume=last_point.volume if last_point is not None else None,
-        curr_volume=None,
-        volume_change_ratio=None,
-        signal_ask_drop=False,
-        signal_volume_spike=False,
+        reason=reason,
+        current_buy_volume=None,
+        cumulative_buy_volume_before=None,
         data_quality=data_quality,
-        confidence=_quality_to_confidence(data_quality),
+        confidence=confidence,
         samples=len(raw_bars),
-        samples_in_window=len(windowed_bars),
+        samples_in_window=samples_in_window,
+        samples_one_word_in_window=samples_one_word_in_window,
     )

@@ -50,19 +50,18 @@ def test_joinquant_provider_fetch_minutes() -> None:
     provider = JoinQuantMinuteProvider(
         username="u",
         password="p",
-        ask_v1_field="volume",
         jq_adapter=FakeJQAdapter(frame),
     )
 
     rows = provider.fetch_intraday_minutes(code="600000", trade_date=date(2025, 1, 10))
     assert len(rows) == 2
-    assert rows[0]["ask_v1"] == 1000
     assert rows[0]["volume"] == 1000
     assert rows[0]["data_quality"] == "minute_proxy"
-    assert rows[1]["limit_down_price"] == 10.0
+    assert rows[0]["limit_down_price"] == 10.0
+    assert "ask_v1" not in rows[0]
 
 
-def test_joinquant_provider_missing_ask_field() -> None:
+def test_joinquant_provider_missing_volume_field() -> None:
     frame = pd.DataFrame(
         {
             "close": [10.0],
@@ -74,7 +73,6 @@ def test_joinquant_provider_missing_ask_field() -> None:
     provider = JoinQuantMinuteProvider(
         username="u",
         password="p",
-        ask_v1_field="volume",
         jq_adapter=FakeJQAdapter(frame),
     )
     with pytest.raises(ValueError) as exc:
@@ -82,12 +80,13 @@ def test_joinquant_provider_missing_ask_field() -> None:
     assert "available columns" in str(exc.value)
 
 
-def test_joinquant_provider_missing_ask_field_fallback_to_volume() -> None:
+def test_joinquant_provider_low_limit_fallback() -> None:
     frame = pd.DataFrame(
         {
             "close": [10.0],
             "high": [10.0],
-            "low_limit": [10.0],
+            "low_limit": [None],
+            "pre_close": [11.11],
             "volume": [1000],
         },
         index=pd.to_datetime(["2025-01-10 14:00:00"]),
@@ -95,14 +94,10 @@ def test_joinquant_provider_missing_ask_field_fallback_to_volume() -> None:
     provider = JoinQuantMinuteProvider(
         username="u",
         password="p",
-        ask_v1_field="a1_v",
-        allow_proxy_fallback=True,
         jq_adapter=FakeJQAdapter(frame),
     )
     rows = provider.fetch_intraday_minutes(code="600000", trade_date=date(2025, 1, 10))
-    assert rows[0]["ask_v1"] == 1000
-    assert rows[0]["ask_v1_source"] == "volume"
-    assert rows[0]["data_quality"] == "minute_proxy"
+    assert rows[0]["limit_down_price"] == round(11.11 * 0.9, 2)
 
 
 def test_joinquant_provider_auth_failed() -> None:
@@ -118,7 +113,6 @@ def test_joinquant_provider_auth_failed() -> None:
     provider = JoinQuantMinuteProvider(
         username="u",
         password="p",
-        ask_v1_field="volume",
         jq_adapter=FakeJQAdapter(frame, auth_error=RuntimeError("bad credential")),
     )
     with pytest.raises(RuntimeError) as exc:
@@ -139,7 +133,6 @@ def test_joinquant_provider_permission_error() -> None:
     provider = JoinQuantMinuteProvider(
         username="u",
         password="p",
-        ask_v1_field="volume",
         jq_adapter=FakeJQAdapter(frame, price_error=RuntimeError("属于付费模块")),
     )
     with pytest.raises(RuntimeError) as exc:
