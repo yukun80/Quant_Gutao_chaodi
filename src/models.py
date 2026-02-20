@@ -103,24 +103,41 @@ class AlertEvent(BaseModel):
     volume_change_ratio: float = 0.0
     signal_ask_drop: bool = False
     signal_volume_spike: bool = False
+    signal_buy_flow: bool = False
     prev_window_ts: datetime | None = None
     curr_window_ts: datetime | None = None
     data_quality: DataQuality = "tick_a1v"
     confidence: ConfidenceLevel = "high"
     trigger_ts: datetime = Field(default_factory=datetime.now)
     reason: str = "window_delta"
+    trigger_rule: str = "window_delta"
+    current_buy_volume: int | None = None
+    cumulative_buy_volume_before: int | None = None
 
     def format_message(self) -> str:
         """Format a human-readable alert body."""
-        return (
-            f"[{self.pool_type}] {self.code} {self.name} 封单异动\n"
-            f"上一窗卖一: {self.initial_ask_v1}\n"
-            f"当前窗卖一: {self.current_ask_v1}\n"
-            f"卖一降幅: {self.drop_ratio:.2%}\n"
-            f"上一窗成交量: {self.initial_volume}\n"
-            f"当前窗成交量: {self.current_volume}\n"
-            f"成交量增幅: {self.volume_change_ratio:.2%}\n"
-            f"信号: ask_drop={self.signal_ask_drop} volume_spike={self.signal_volume_spike}\n"
-            f"数据质量: {self.data_quality}/{self.confidence}\n"
-            f"触发时间: {self.trigger_ts:%Y-%m-%d %H:%M:%S}"
+        lines = [
+            f"[{self.pool_type}] {self.code} {self.name} 封单异动",
+            f"触发规则: {self.trigger_rule}",
+            f"上一窗卖一: {self.initial_ask_v1}",
+            f"当前窗卖一: {self.current_ask_v1}",
+            f"卖一降幅: {self.drop_ratio:.2%}",
+            f"上一窗成交量: {self.initial_volume}",
+            f"当前窗成交量: {self.current_volume}",
+            f"成交量增幅: {self.volume_change_ratio:.2%}",
+        ]
+        if self.current_buy_volume is not None and self.cumulative_buy_volume_before is not None:
+            lines.extend(
+                [
+                    f"当前分钟成交量(代理): {self.current_buy_volume}",
+                    f"当日前序累计成交量: {self.cumulative_buy_volume_before}",
+                ]
+            )
+        lines.extend(
+            [
+                f"信号: buy_flow={self.signal_buy_flow} ask_drop={self.signal_ask_drop}",
+                f"数据质量: {self.data_quality}/{self.confidence}",
+                f"触发时间: {self.trigger_ts:%Y-%m-%d %H:%M:%S}",
+            ]
         )
+        return "\n".join(lines)

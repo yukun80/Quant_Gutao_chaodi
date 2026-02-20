@@ -8,19 +8,25 @@ from datetime import datetime
 
 from .models import AlertEvent, DataQuality, PoolStock, SignalCombination, StockSnapshot
 
+RULE_BUY_FLOW = "buy_flow_breakout"
+RULE_SELL1_DROP = "sell1_drop"
+RULE_COMBINED = "buy_flow_breakout_and_sell1_drop"
+ALL_RULES = {RULE_BUY_FLOW, RULE_SELL1_DROP}
+
 
 @dataclass(frozen=True)
-class _WindowPoint:
-    """One window's normalized features for delta comparison."""
+class _MinuteBucket:
+    """Per-symbol one-minute aggregation snapshot based on last quote in that minute."""
 
-    ts: datetime
-    ask_v1: int
-    volume: int
+    minute_key: datetime
+    end_ts: datetime
+    end_volume_total: int
+    last_ask_v1: int
     data_quality: DataQuality
 
 
 class StrategyEngine:
-    """Evaluate window deltas and emit at most one alert per symbol per day."""
+    """Evaluate one-word minute signals and emit per-rule alerts with OR semantics."""
 
     def __init__(
         self,
@@ -35,152 +41,226 @@ class StrategyEngine:
     ) -> None:
         # Keep backward compatibility: old callers may still pass vol_drop_threshold.
         resolved_ask_threshold = ask_drop_threshold if ask_drop_threshold is not None else vol_drop_threshold
-        # ask_drop_threshold drives sell1-drop detection on adjacent windows.
         self.ask_drop_threshold = resolved_ask_threshold if resolved_ask_threshold is not None else 0.5
-        # volume_spike_threshold drives volume surge detection on adjacent windows.
+
+        # Deprecated compatibility fields kept for existing callers/config.
         self.volume_spike_threshold = volume_spike_threshold
-        # "and"/"or" defines whether both sub-signals are required.
         self.signal_combination = signal_combination
-        # Absolute gates prevent tiny changes from passing ratio checks.
-        self.min_abs_delta_ask = max(min_abs_delta_ask, 0)
         self.min_abs_delta_volume = max(min_abs_delta_volume, 0)
-        # confirm_minutes means how many consecutive windows must satisfy the rule.
-        self.confirm_minutes = max(confirm_minutes, 1)
-        # Backward-compatible alias for historical field name.
         self.vol_drop_threshold = self.ask_drop_threshold
-        # Stores previous window metrics per symbol for rolling delta detection.
-        self.prev_window_map: dict[str, _WindowPoint] = {}
-        # Tracks consecutive threshold-hit count per symbol.
-        self.confirm_count_map: dict[str, int] = {}
-        # Once alerted, symbol is muted for the rest of the day.
-        self.processed_set: set[str] = set()
-        # Active symbols currently eligible for evaluation.
+
+        # Sell1-drop confirmation counter (applies to RULE_SELL1_DROP only).
+        self.confirm_minutes = max(confirm_minutes, 1)
+        self.min_abs_delta_ask = max(min_abs_delta_ask, 0)
+
         self.active_pool: dict[str, PoolStock] = {}
-        # Symbols explicitly removed after open-board behavior is observed.
         self.removed_pool: set[str] = set()
+
+        # Fully silenced symbols: both rules have already fired.
+        self.processed_set: set[str] = set()
+
+        # Per-rule fired marks to support "each rule once".
+        self.fired_rules_map: dict[str, set[str]] = {}
+
+        # One-word minute state.
+        self.prev_bucket_map: dict[str, _MinuteBucket] = {}
+        self.current_bucket_map: dict[str, _MinuteBucket] = {}
+
+        # Sell1-drop consecutive confirmation state.
+        self.sell1_confirm_count_map: dict[str, int] = {}
+
+        # Backward-compatible aliases for historical field names.
+        self.prev_window_map = self.prev_bucket_map
+        self.confirm_count_map = self.sell1_confirm_count_map
 
     def register_pool(self, stocks: Iterable[PoolStock]) -> None:
         """Reset engine state and register today's candidate symbols."""
         self.active_pool = {stock.code: stock for stock in stocks}
-        self.prev_window_map.clear()
-        self.confirm_count_map.clear()
-        self.processed_set.clear()
         self.removed_pool.clear()
+        self.processed_set.clear()
+        self.fired_rules_map.clear()
+        self.prev_bucket_map.clear()
+        self.current_bucket_map.clear()
+        self.sell1_confirm_count_map.clear()
 
     def monitorable_codes(self) -> list[str]:
-        """Return symbols that are still active and not yet alerted."""
+        """Return symbols that are still active and not fully silenced."""
         return [code for code in self.active_pool if code not in self.processed_set]
 
-    def evaluate(self, snapshot: StockSnapshot) -> AlertEvent | None:
-        """Consume one snapshot and return an alert when trigger condition is met."""
-        code = snapshot.code
-        pool_stock = self.active_pool.get(code)
-        # Ignore symbols that are not active or already alerted (one-shot semantics).
-        if pool_stock is None or code in self.processed_set:
-            return None
+    @staticmethod
+    def _minute_key(ts: datetime) -> datetime:
+        """Round timestamp down to minute precision for minute-bucket grouping."""
+        return ts.replace(second=0, microsecond=0)
 
-        # Once high price breaks limit-down, the symbol is no longer one-word.
-        if snapshot.high_price > snapshot.limit_down_price:
-            self.removed_pool.add(code)
-            self.active_pool.pop(code, None)
-            self.prev_window_map.pop(code, None)
-            self.confirm_count_map.pop(code, None)
-            return None
-
-        if not snapshot.is_one_word_limit_down:
-            # Non one-word bars break consecutive confirmation.
-            self.confirm_count_map[code] = 0
-            return None
-
-        # Each new bar is treated as the current rolling window point.
-        current_ask = max(snapshot.ask_v1, 0)
-        current_volume = max(snapshot.volume, 0)
-        current_point = _WindowPoint(
-            ts=snapshot.ts,
-            ask_v1=current_ask,
-            volume=current_volume,
+    def _build_bucket(self, snapshot: StockSnapshot) -> _MinuteBucket:
+        """Convert one snapshot to an in-progress minute bucket."""
+        return _MinuteBucket(
+            minute_key=self._minute_key(snapshot.ts),
+            end_ts=snapshot.ts,
+            end_volume_total=max(snapshot.volume, 0),
+            last_ask_v1=max(snapshot.ask_v1, 0),
             data_quality=snapshot.data_quality,
         )
 
-        previous = self.prev_window_map.get(code)
-        if previous is None:
-            # First valid window only initializes baseline for adjacent-window deltas.
-            self.prev_window_map[code] = current_point
-            self.confirm_count_map[code] = 0
-            return None
+    def _clear_symbol_runtime_state(self, code: str) -> None:
+        """Drop minute-comparison runtime state for one symbol."""
+        self.prev_bucket_map.pop(code, None)
+        self.current_bucket_map.pop(code, None)
+        self.sell1_confirm_count_map.pop(code, None)
 
-        # Adjacent-window deltas: never compare against a fixed intraday baseline.
-        ask_base = max(previous.ask_v1, 1)
-        volume_base = max(previous.volume, 1)
-        ask_delta = previous.ask_v1 - current_ask
-        volume_delta = current_volume - previous.volume
-        ask_change_ratio = ask_delta / ask_base
-        volume_change_ratio = volume_delta / volume_base
+    def _emit_alert_if_hit(
+        self,
+        code: str,
+        pool_stock: PoolStock,
+        previous: _MinuteBucket,
+        current: _MinuteBucket,
+    ) -> AlertEvent | None:
+        """Evaluate both rules on a completed one-word minute and build alert if any hit."""
+        fired_rules = self.fired_rules_map.setdefault(code, set())
 
-        # Sub-signal A: sell1 drops from previous window to current window.
-        signal_ask_drop = ask_change_ratio >= self.ask_drop_threshold and ask_delta >= self.min_abs_delta_ask
-        # Sub-signal B: traded volume rises from previous window to current window.
-        signal_volume_spike = (
-            volume_change_ratio >= self.volume_spike_threshold and volume_delta >= self.min_abs_delta_volume
+        cumulative_before = max(previous.end_volume_total, 0)
+        current_buy_volume = max(current.end_volume_total - previous.end_volume_total, 0)
+        signal_buy_flow = (
+            RULE_BUY_FLOW not in fired_rules
+            and cumulative_before > 0
+            and current_buy_volume > cumulative_before
         )
 
-        if self.signal_combination == "or":
-            hit = signal_ask_drop or signal_volume_spike
-        else:
-            hit = signal_ask_drop and signal_volume_spike
+        ask_base = max(previous.last_ask_v1, 1)
+        ask_delta = previous.last_ask_v1 - current.last_ask_v1
+        ask_change_ratio = ask_delta / ask_base
+        ask_drop_hit = ask_change_ratio >= self.ask_drop_threshold and ask_delta >= self.min_abs_delta_ask
 
-        if not hit:
-            # Reset confirmation streak when this window does not satisfy rule.
-            self.confirm_count_map[code] = 0
-            # Always slide forward so next bar compares against the latest window.
-            self.prev_window_map[code] = current_point
+        if ask_drop_hit:
+            hit_count = self.sell1_confirm_count_map.get(code, 0) + 1
+        else:
+            hit_count = 0
+        self.sell1_confirm_count_map[code] = hit_count
+
+        signal_sell1_drop = (
+            RULE_SELL1_DROP not in fired_rules
+            and ask_drop_hit
+            and hit_count >= self.confirm_minutes
+        )
+
+        if not signal_buy_flow and not signal_sell1_drop:
             return None
 
-        # Count consecutive satisfied windows.
-        hit_count = self.confirm_count_map.get(code, 0) + 1
-        self.confirm_count_map[code] = hit_count
-        self.prev_window_map[code] = current_point
-        if hit_count < self.confirm_minutes:
-            return None
-
-        # One-shot trigger: emit once and silence the symbol immediately.
-        if signal_ask_drop and signal_volume_spike:
-            reason = "volume_spike_and_sell1_drop"
-        elif signal_ask_drop:
-            reason = "sell1_drop"
+        if signal_buy_flow and signal_sell1_drop:
+            reason = RULE_COMBINED
+        elif signal_buy_flow:
+            reason = RULE_BUY_FLOW
         else:
-            reason = "volume_spike"
+            reason = RULE_SELL1_DROP
 
-        confidence = "high" if current_point.data_quality == "tick_a1v" else "low"
-        # One-shot silencing happens immediately after trigger.
-        self.processed_set.add(code)
+        if signal_buy_flow:
+            fired_rules.add(RULE_BUY_FLOW)
+        if signal_sell1_drop:
+            fired_rules.add(RULE_SELL1_DROP)
+
+        if fired_rules >= ALL_RULES:
+            self.processed_set.add(code)
+
+        confidence = "high" if current.data_quality == "tick_a1v" else "low"
+        volume_change_ratio = (current.end_volume_total - previous.end_volume_total) / max(previous.end_volume_total, 1)
 
         return AlertEvent(
             code=code,
             name=pool_stock.name,
             pool_type=pool_stock.pool_type,
-            initial_ask_v1=previous.ask_v1,
-            current_ask_v1=current_ask,
+            initial_ask_v1=previous.last_ask_v1,
+            current_ask_v1=current.last_ask_v1,
             drop_ratio=ask_change_ratio,
-            initial_volume=previous.volume,
-            current_volume=current_volume,
+            initial_volume=previous.end_volume_total,
+            current_volume=current.end_volume_total,
             volume_change_ratio=volume_change_ratio,
-            signal_ask_drop=signal_ask_drop,
-            signal_volume_spike=signal_volume_spike,
-            prev_window_ts=previous.ts,
-            curr_window_ts=current_point.ts,
-            data_quality=current_point.data_quality,
+            signal_ask_drop=signal_sell1_drop,
+            signal_volume_spike=False,
+            signal_buy_flow=signal_buy_flow,
+            prev_window_ts=previous.end_ts,
+            curr_window_ts=current.end_ts,
+            data_quality=current.data_quality,
             confidence=confidence,
-            trigger_ts=current_point.ts,
+            trigger_ts=current.end_ts,
             reason=reason,
+            trigger_rule=reason,
+            current_buy_volume=current_buy_volume if signal_buy_flow else None,
+            cumulative_buy_volume_before=cumulative_before if signal_buy_flow else None,
         )
+
+    def _finalize_completed_bucket(self, code: str, pool_stock: PoolStock, completed: _MinuteBucket) -> AlertEvent | None:
+        """Finalize one completed minute and evaluate OR rules against previous one-word minute."""
+        previous = self.prev_bucket_map.get(code)
+        if previous is None:
+            self.sell1_confirm_count_map[code] = 0
+            return None
+        return self._emit_alert_if_hit(code, pool_stock, previous=previous, current=completed)
+
+    def evaluate(self, snapshot: StockSnapshot) -> AlertEvent | None:
+        """Consume one snapshot and return an alert when any eligible rule is triggered."""
+        code = snapshot.code
+        pool_stock = self.active_pool.get(code)
+        if pool_stock is None or code in self.processed_set:
+            return None
+
+        if snapshot.high_price > snapshot.limit_down_price:
+            self.removed_pool.add(code)
+            self.active_pool.pop(code, None)
+            self._clear_symbol_runtime_state(code)
+            self.fired_rules_map.pop(code, None)
+            return None
+
+        # Global gate: both Rule A and Rule B must run under one-word condition.
+        if not snapshot.is_one_word_limit_down:
+            self._clear_symbol_runtime_state(code)
+            return None
+
+        current = self.current_bucket_map.get(code)
+        incoming = self._build_bucket(snapshot)
+
+        if current is None:
+            self.current_bucket_map[code] = incoming
+            return None
+
+        if incoming.minute_key == current.minute_key:
+            # Same minute: keep latest quote as minute-end approximation.
+            self.current_bucket_map[code] = incoming
+            return None
+
+        # Minute changed: finalize previous minute then roll forward.
+        event = self._finalize_completed_bucket(code, pool_stock, completed=current)
+        self.prev_bucket_map[code] = current
+        self.current_bucket_map[code] = incoming
+        return event
+
+    def flush_pending(self) -> list[AlertEvent]:
+        """Finalize pending minute buckets (typically called once at session end)."""
+        events: list[AlertEvent] = []
+        for code, current in list(self.current_bucket_map.items()):
+            pool_stock = self.active_pool.get(code)
+            if pool_stock is None or code in self.processed_set:
+                continue
+
+            event = self._finalize_completed_bucket(code, pool_stock, completed=current)
+            self.prev_bucket_map[code] = current
+            if event is not None:
+                events.append(event)
+
+        # Prevent duplicate alerts if flush is called multiple times.
+        self.current_bucket_map.clear()
+        return events
 
     def summary(self) -> dict[str, int]:
         """Return compact runtime counters for logging and diagnostics."""
+        triggered_buy_flow = sum(1 for rules in self.fired_rules_map.values() if RULE_BUY_FLOW in rules)
+        triggered_sell1_drop = sum(1 for rules in self.fired_rules_map.values() if RULE_SELL1_DROP in rules)
         return {
             "active": len(self.active_pool),
             "processed": len(self.processed_set),
             "removed": len(self.removed_pool),
-            "window_state": len(self.prev_window_map),
-            "confirming": sum(1 for value in self.confirm_count_map.values() if value > 0),
+            "current_minutes": len(self.current_bucket_map),
+            "previous_minutes": len(self.prev_bucket_map),
+            "triggered_buy_flow": triggered_buy_flow,
+            "triggered_sell1_drop": triggered_sell1_drop,
+            "fully_silenced": len(self.processed_set),
         }

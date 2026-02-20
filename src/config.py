@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     VOLUME_SPIKE_THRESHOLD: float = Field(default=0.8)
     SIGNAL_WINDOW_MINUTES: int = Field(default=1)
     SIGNAL_COMBINATION: str = "and"
+    LIVE_CONFIRM_MINUTES: int = Field(default=1)
     MIN_ABS_DELTA_ASK: int = 0
     MIN_ABS_DELTA_VOLUME: int = 0
     MAX_CONCURRENCY: int = Field(default=50)
@@ -105,12 +106,12 @@ class Settings(BaseSettings):
             raise ValueError("MIN_ABS_DELTA values must be >= 0")
         return value
 
-    @field_validator("BACKTEST_CONFIRM_MINUTES")
+    @field_validator("LIVE_CONFIRM_MINUTES", "BACKTEST_CONFIRM_MINUTES")
     @classmethod
     def validate_confirm_minutes(cls, value: int) -> int:
         """Require a positive consecutive confirmation count."""
         if value <= 0 or value > 20:
-            raise ValueError("BACKTEST_CONFIRM_MINUTES must be in [1, 20]")
+            raise ValueError("CONFIRM_MINUTES must be in [1, 20]")
         return value
 
     @field_validator("SIGNAL_COMBINATION", "BACKTEST_SIGNAL_COMBINATION")

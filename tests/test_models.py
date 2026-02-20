@@ -1,6 +1,6 @@
 """Model parsing and normalization tests."""
 
-from src.models import StockSnapshot
+from src.models import AlertEvent, StockSnapshot
 
 
 def test_snapshot_cleaning_dash_and_empty() -> None:
@@ -32,3 +32,23 @@ def test_snapshot_cleaning_numeric_string() -> None:
     assert snap.ask_v1 == 12345
     assert snap.volume == 6789
     assert snap.is_one_word_limit_down
+
+
+def test_alert_event_message_contains_rule_and_buy_flow_fields() -> None:
+    event = AlertEvent(
+        code="600000",
+        name="Demo",
+        pool_type="all",
+        initial_ask_v1=1000,
+        current_ask_v1=500,
+        drop_ratio=0.5,
+        reason="buy_flow_breakout",
+        trigger_rule="buy_flow_breakout",
+        signal_buy_flow=True,
+        current_buy_volume=300,
+        cumulative_buy_volume_before=200,
+    )
+    body = event.format_message()
+    assert "触发规则: buy_flow_breakout" in body
+    assert "当前分钟成交量(代理): 300" in body
+    assert "当日前序累计成交量: 200" in body

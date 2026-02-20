@@ -43,11 +43,8 @@ async def run_live() -> None:
 
     engine = StrategyEngine(
         ask_drop_threshold=settings.ASK_DROP_THRESHOLD if settings.ASK_DROP_THRESHOLD is not None else settings.VOL_DROP_THRESHOLD,
-        volume_spike_threshold=settings.VOLUME_SPIKE_THRESHOLD,
-        confirm_minutes=settings.BACKTEST_CONFIRM_MINUTES,
-        signal_combination=settings.SIGNAL_COMBINATION,  # type: ignore[arg-type]
+        confirm_minutes=settings.LIVE_CONFIRM_MINUTES,
         min_abs_delta_ask=settings.MIN_ABS_DELTA_ASK,
-        min_abs_delta_volume=settings.MIN_ABS_DELTA_VOLUME,
     )
     engine.register_pool(pool)
 
@@ -70,6 +67,12 @@ async def run_live() -> None:
     rounds = 0
     alerts = 0
 
+    def _send_event(event) -> None:
+        nonlocal alerts
+        if notifier.send_alert(event):
+            alerts += 1
+            logger.info("alert sent: {} rule={} drop={:.2%}", event.code, event.trigger_rule, event.drop_ratio)
+
     while in_monitor_window(datetime.now(), start, end):
         rounds += 1
         codes = engine.monitorable_codes()
@@ -82,12 +85,12 @@ async def run_live() -> None:
             event = engine.evaluate(snapshot)
             if event is None:
                 continue
-
-            if notifier.send_alert(event):
-                alerts += 1
-                logger.info("alert sent: {} drop={:.2%}", event.code, event.drop_ratio)
+            _send_event(event)
 
         await asyncio.sleep(settings.POLL_INTERVAL_SEC)
+
+    for event in engine.flush_pending():
+        _send_event(event)
 
     logger.info("runtime summary rounds={} alerts={} state={}", rounds, alerts, engine.summary())
 
