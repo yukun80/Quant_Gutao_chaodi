@@ -40,8 +40,8 @@
 | `src/notifier.py` | Apprise 通知网关封装。 |
 | `src/main.py` | 实盘主入口，串联建池、采集、评估、通知。 |
 | `src/backtest/__init__.py` | 回测包导出入口。 |
-| `src/backtest/mapper.py` | 回测分钟数据映射到 `StockSnapshot`。 |
-| `src/backtest/runner.py` | 单股单日回放执行器，复用 `StrategyEngine`。 |
+| `src/backtest/mapper.py` | 回测辅助映射工具（当前主链路仅用 `normalize_code_to_jq`）。 |
+| `src/backtest/runner.py` | 单股单日 buy-flow 回放执行器（全天累计 + 窗口内触发）。 |
 | `src/backtest/providers/base.py` | 回测数据源抽象接口。 |
 | `src/backtest/providers/joinquant_provider.py` | JoinQuant 分钟数据接入与错误分类。 |
 | `src/backtest/providers/__init__.py` | 回测 provider 导出入口。 |
@@ -58,6 +58,8 @@
 | `tests/test_backtest_runner.py` | 回放执行分类结果测试。 |
 | `tests/test_backtest_joinquant_provider.py` | JoinQuant provider 认证/字段行为测试。 |
 | `tests/test_backtest_cli.py` | CLI 参数与返回码契约测试。 |
+| `tests/test_fetcher.py` | EastMoney 可选 Header/Cookie 配置与解析测试。 |
+| `tests/test_notifier.py` | 通知网关关键词注入与发送体测试。 |
 
 ### 3.3 `scripts/` 脚本入口
 
@@ -73,9 +75,9 @@
 | `doc/Development_White_Paper.md` | 项目白皮书与最初架构设计。 |
 | `doc/worklog/2026-02-18_implementation_status.md` | 第一阶段实现状态记录。 |
 | `doc/worklog/2026-02-19_backtest_implementation_status.md` | 回测实现阶段总结。 |
+| `doc/worklog/2026-02-20_current_framework_status.md` | 当前框架状态、已实现与未实现清单。 |
 | `doc/Project_Architecture_Guide.md` | 当前文档：全路径与架构说明。 |
 | `doc/Project_Memory.md` | 项目记忆与决策约束沉淀。 |
-| `doc/Commenting_Convention.md` | 注释规范与维护原则。 |
 
 ---
 
@@ -95,12 +97,14 @@
 
 ## 5. 回测主链路（`src/backtest_cli.py`）
 
-1. 解析参数（日期、代码、阈值、数据源、字段映射）。
+1. 解析参数（日期、代码、数据源、账号、窗口）。
 2. 输出 precheck（运行上下文确认）。
 3. 初始化 provider（当前仅 JoinQuant）。
 4. 拉取单股单日分钟数据。
-5. 以“全天累计 + 窗口内判定”方式回放分钟数据。
-6. 使用回测专用 buy-flow 规则判断是否触发。
+5. 按时间排序后做“全天累计 + 窗口内判定”回放。
+6. 使用回测专用 buy-flow 规则判断是否触发：
+   - 仅在一字跌停分钟统计买量代理（`volume`）。
+   - `current_buy_volume > cumulative_buy_volume_before` 时触发。
 7. 输出回测报告（触发状态、原因、触发时刻、当前买量、累计基准等）。
 
 ---
@@ -121,15 +125,20 @@
 ### 6.2 回测相关
 
 - `BACKTEST_SOURCE`: 回测数据源（当前 `joinquant`）。
+- `BACKTEST_WINDOW_START` / `BACKTEST_WINDOW_END`: 回测判定窗口（默认继承实盘窗口）。
 - `JQ_USERNAME` / `JQ_PASSWORD`: JoinQuant 账号认证信息。
 - `BACKTEST_USE_NOTIFIER`: 预留开关，当前未接入发送逻辑。
+
+说明：
+- `src/config.py` 里仍保留一组历史回测字段（如 `BACKTEST_PROXY_MODE`、`BACKTEST_SIGNAL_COMBINATION` 等）。
+- 当前 buy-flow 回测主链路不消费这些历史字段，属于待清理的兼容配置。
 
 ---
 
 ## 7. 关键设计约束
 
 1. 实盘与回测策略允许分叉：实盘使用盘口异动引擎，回测使用 buy-flow 分钟策略。
-2. `StockSnapshot` 是策略输入契约，不允许策略层直接消费原始 dict。
+2. `StockSnapshot` 输入契约当前主要约束实盘链路；回测 buy-flow 直接消费 provider 分钟字段。
 3. one-shot 规则固定：单标的单日只允许触发一次。
 4. 一旦开板（`high_price > limit_down_price`）立即剔除，不再监控。
 5. 当前回测是分钟级近似，不等价于 tick 级逐笔成交与盘口回放。

@@ -12,6 +12,7 @@
   - 仅在“一字跌停分钟”将 `volume` 视为买量代理。
   - 触发条件：`current_buy_volume > cumulative_buy_volume_before`。
   - `cumulative` 为全天累计（09:30 起），触发判定仅在回测窗口内执行。
+  - 当前窗口判定为闭区间（默认包含 `15:00` 分钟线）。
 
 ---
 
@@ -74,6 +75,10 @@
 - `BACKTEST_SOURCE=joinquant`
 - `BACKTEST_WINDOW_START=13:00`
 - `BACKTEST_WINDOW_END=15:00`
+
+补充：
+- `src/config.py` 中仍保留历史回测参数（`BACKTEST_PROXY_MODE`、`BACKTEST_SIGNAL_COMBINATION` 等），当前主路径未使用。
+- 这些参数属于兼容遗留，后续应统一清理或迁移。
 
 ---
 

@@ -1,5 +1,19 @@
 # Project Gutao_Chaodi: A股下午盘异动监控机器人系统架构与开发白皮书
 
+> 状态说明（2026-02-20）  
+> 本文档是“初版设计白皮书”，部分内容已与当前代码实现产生偏差。  
+> 当前落地实现请以 `doc/Project_Architecture_Guide.md`、`doc/Project_Memory.md`、`doc/worklog/2026-02-20_current_framework_status.md` 为准。
+
+## 0. 现状对齐摘要（As-Built Delta）
+
+| 主题 | 白皮书原始设想 | 当前实现（2026-02-20） |
+| --- | --- | --- |
+| 回测判定内核 | 回测与实盘复用盘口异动逻辑（`ask_v1`） | 回测已切换为 buy-flow 分钟策略：一字跌停分钟使用 `volume` 代理买量，按“当前分钟 > 前序全天累计”触发。 |
+| 回测数据字段 | 假定可稳定获取 `ask_v1/a1_v` | 免费 JoinQuant 分钟回测路径不依赖 `ask_v1`，仅依赖 `close/high/low_limit/pre_close/volume`。 |
+| 回测参数 | 阈值、组合关系、代理模式 | 当前 CLI 仅保留日期/代码/数据源/账号/窗口参数，旧参数已退出主路径。 |
+| 策略一致性约束 | 实盘与回测同一引擎 | 当前允许分叉：实盘继续 `StrategyEngine`，回测使用独立 runner。 |
+| Producer-Consumer 内存队列 | 规划显式队列解耦 | 当前实盘主循环内直接处理；未单独实现显式队列组件。 |
+
 ---
 ## 1. 项目概览 (Executive Summary)
 
@@ -169,6 +183,7 @@ processed_stocks = set()
 
 * 推荐平台: 聚宽 (JoinQuant) 或 米筐 (RiceQuant)。
 * 数据优势: 这些平台提供历史 Tick 快照 或 包含盘口信息的分钟线，能够查询到历史任意时刻的 `ask_v1` (卖一量)。
+* 落地差异（2026-02-20）: 当前项目采用 JoinQuant 免费分钟字段回测，不依赖历史 `ask_v1` 字段。
 * 验证流程:
 1. 注册/登录: 使用聚宽/米筐的研究环境 (Jupyter Notebook)。
 2. 编写验证脚本:
