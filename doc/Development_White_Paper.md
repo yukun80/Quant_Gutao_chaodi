@@ -1,29 +1,31 @@
 # Project Gutao_Chaodi: A股下午盘异动监控机器人系统架构与开发白皮书
 
-> 状态说明（2026-02-20）  
-> 本文档是“初版设计白皮书”，部分内容已与当前代码实现产生偏差。  
-> 当前落地实现请以 `doc/Project_Architecture_Guide.md`、`doc/Project_Memory.md`、`doc/worklog/2026-02-20_current_framework_status.md` 为准。
+> 状态说明（2026-02-21）  
+> 本文档已按当前仓库实现更新为 As-Built 版本。  
+> 运行细节以 `doc/Project_Architecture_Guide.md`、`doc/Project_Memory.md`、`doc/worklog/2026-02-20_current_framework_status.md` 为准。
 
 ## 0. 现状对齐摘要（As-Built Delta）
 
-| 主题 | 白皮书原始设想 | 当前实现（2026-02-20） |
+| 主题 | 白皮书原始设想 | 当前实现（2026-02-21） |
 | --- | --- | --- |
 | 回测判定内核 | 回测与实盘复用盘口异动逻辑（`ask_v1`） | 回测已切换为 buy-flow 分钟策略：一字跌停分钟使用 `volume` 代理买量，按“当前分钟 > 前序全天累计”触发。 |
 | 回测数据字段 | 假定可稳定获取 `ask_v1/a1_v` | 免费 JoinQuant 分钟回测路径不依赖 `ask_v1`，仅依赖 `close/high/low_limit/pre_close/volume`。 |
 | 回测参数 | 阈值、组合关系、代理模式 | 当前 CLI 仅保留日期/代码/数据源/账号/窗口参数，旧参数已退出主路径。 |
 | 策略一致性约束 | 实盘与回测同一引擎 | 当前允许分叉：实盘继续 `StrategyEngine`，回测使用独立 runner。 |
-| Producer-Consumer 内存队列 | 规划显式队列解耦 | 当前实盘主循环内直接处理；未单独实现显式队列组件。 |
+| Webhook 交互模式 | 支持入站回调命令与出站通知 | 当前仅保留 Webhook 出站通知，入站命令回调链路已移除。 |
+| 日调度模式 | 午盘窗口内运行 | 当前为“两段式调度”：09:26 统计一字跌停 + 13:00-15:00 名单监控。 |
+| 实盘建池数据源 | 依赖多源静态元数据拼接 | 当前为 AkShare 在线建池 + 本地缓存回退（`POOL_FAILOVER_MODE=cache`）。 |
 
 ---
 ## 1. 项目概览 (Executive Summary)
 
 ### 1.1 业务背景
 
-本项目旨在构建一套高频自动化监控系统，针对 A 股市场中的 “跌停板下午盘翘板” (Limit-Down Open at Tail) 交易策略进行实时信号捕捉。策略核心逻辑为：监控 T 日下午盘（13:00 - 15:00）跌停股封单的急剧变化（主力撤单或买入），以捕捉 T+1 日集合竞价的高溢价机会。
+本项目旨在构建一套高频自动化监控系统，针对 A 股市场中的“一字跌停翘板”场景进行信号捕捉。当前生产链路分为两段：先在 T 日北京时间 09:26 统计一字跌停标的并群发摘要，再在 13:00 - 15:00 对该名单进行封单异动监控并自动推送策略信号。
 
 ### 1.2 系统目标
 
-* 低延迟 (Low Latency): 在下午盘 2 小时完整交易时段内，保持对目标股票池的秒级轮询，确保长周期运行无积压。
+* 低延迟 (Low Latency): 在午盘 2 小时交易时段内，保持对 09:26 名单的秒级轮询，确保长周期运行无积压。
 * 高可用 (High Availability): 具备网络抖动自动重试机制，并针对 2 小时长时运行优化内存管理（GC调优），防止内存泄漏导致的进程崩溃。
 * 低噪性 (Low Noise): 引入“信号防抖与静默机制” (Debounce & Silence)，针对盘中反复“跌停-开板-跌停”的拉锯个股，一旦开板并提醒过后，不在看作一字跌停，不在进行追踪，避免重复发送无效报警。
 
@@ -37,8 +39,7 @@
 
 | 架构层级 | 功能模块 | 选型方案 | 原始方案 (手动) | 引入理由与核心价值 |
 | --- | --- | --- | --- | --- |
-| 数据接入层 | 实时 ST 列表 | AkShare | 手写爬虫解析网页 | 接口稳定性: 封装了交易所/东方财富接口，直接返回清洗后的 DataFrame，无需维护爬虫反爬逻辑。 |
-| 数据接入层 | 基础元数据 | Tushare Pro | (同上) | 数据标准化: 即使 Tushare 实时性稍弱，但其提供的上市日期 (`list_date`) 等静态数据最为规范，用于过滤新股。 |
+| 数据接入层 | 股票池构建 | AkShare（在线）+ 本地缓存（回退） | 手写爬虫解析网页 | 兼顾可用性与一致性: 在线获取全A清单与 ST 标签，失败时自动回退缓存，减少盘前初始化中断。 |
 | 网络层 | 高并发请求 | Aiohttp | `Requests` (同步) | 异步 I/O: 利用 Python `asyncio` 协程机制，实现单线程下的非阻塞高并发，满足秒级扫描 100+ 标的需求。 |
 | 容错层 | 网络重试 | Tenacity | `try-except-sleep` | 弹性恢复: 提供声明式的重试装饰器（指数退避算法），优雅处理网络超时和接口限流，代码零侵入。 |
 | 领域模型层 | 数据校验 | Pydantic | 原生 Dict | 契约精神: 强制定义数据输入输出格式，自动处理类型转换（如将 "-" 转为 0），防止脏数据污染策略逻辑。 |
@@ -50,37 +51,24 @@
 
 ## 3. 总体架构设计 (System Architecture)
 
-系统采用 “生产者-消费者” (Producer-Consumer) 微内核架构，通过内存队列实现解耦。
+当前系统为“日调度 + 午盘会话”两级架构，重点是交易日判断与名单驱动监控。
 
 ```mermaid
 graph TD
-    subgraph "Initialization (Pre-Market)"
-        A[Config Loader] -->|Pydantic Settings| ENV[.env Config]
-        B[Pool Manager] -->|AkShare| API1[Real-time ST List]
-        B -->|Tushare Pro| API2[Stock Metadata]
-        B -->|Merge & Filter| POOL[Target Stock Pool]
-    end
+    CFG[Config Loader] --> APP[Scheduler: src/app.py]
+    APP --> CAL[Trading Calendar: AkShare]
+    APP --> POOL[Pool Manager]
+    POOL --> SNAP0926[09:26 Snapshot Scan]
+    SNAP0926 --> FILTER[One-Word Filter]
+    FILTER --> SUMMARY[09:26 DingTalk Summary]
 
-    subgraph "Runtime Loop (13:00 - 15:00)"
-        direction TB
-        PRODUCER[Data Fetcher Service]
-        QUEUE[[Async Memory Queue]]
-        CONSUMER[Strategy Engine]
-        
-        POOL --> PRODUCER
-        PRODUCER -->|Aiohttp + Tenacity| EM_API[EastMoney API]
-        EM_API -->|Raw JSON| PRODUCER
-        PRODUCER -->|Validate| MODEL[StockSnapshot Model]
-        MODEL --> QUEUE
-        
-        QUEUE --> CONSUMER
-        CONSUMER -->|State Compare| LOGIC{Signal Logic}
-        
-        LOGIC -->|No Anomaly| PASS[Ignore / Next Loop]
-        LOGIC -->|Anomaly Detected| ALERT[Notification Service]
-    end
-
-    ALERT -->|Apprise SDK| DING[DingTalk Group]
+    FILTER --> LIST[Selected Codes]
+    LIST --> LIVE[run_live 13:00-15:00]
+    LIVE --> FETCH[EastMoney Fetcher]
+    FETCH --> ENGINE[Strategy Engine]
+    ENGINE --> ALERT[Notification Gateway]
+    SUMMARY --> DING[DingTalk Group]
+    ALERT --> DING
 ```
 
 ---
@@ -93,14 +81,17 @@ graph TD
 * 依赖框架: `pydantic-settings`
 * 设计规范: 禁止在代码中硬编码任何密钥或参数。
 * 实施说明:
-通过定义 `Settings` 类，系统启动时会自动读取 `.env` 文件。如果缺少关键配置（如 Tushare Token），程序将直接报错启动失败，实现 Fail-fast。
+通过定义 `Settings` 类，系统启动时会自动读取 `.env` 文件。关键配置缺失时程序会启动失败，实现 Fail-fast。
 
 ```python
 # 示例：通过类型注解强制规范配置格式
 class Settings(BaseSettings):
-    TUSHARE_TOKEN: str
     DINGTALK_URL: str
-    VOL_DROP_THRESHOLD: float = 0.2  # 默认 20%
+    VOL_DROP_THRESHOLD: float = 0.3
+    POOL_PROVIDER: str = "akshare"
+    POOL_CACHE_PATH: str = "data/pool_cache/latest_pool.csv"
+    POOL_CACHE_TTL_HOURS: int = 36
+    POOL_FAILOVER_MODE: str = "cache"
     
     class Config:
         env_file = ".env"
@@ -110,11 +101,12 @@ class Settings(BaseSettings):
 ### 4.2 模块 B：股票池构建 (Pool Manager)
 
 * 功能: 每日开盘前生成当天的监控目标列表。
-* 依赖框架: `AkShare` (主), `Tushare` (辅), `Pandas`
+* 依赖框架: `AkShare`, `Pandas`
 * 数据融合逻辑:
-1. 调用 `ak.stock_zh_a_st_em()` 获取全市场实时 ST 股（AkShare 优势：实时性强，包含代码、名称、现价）。
-2. 调用 `ts.pro_api().stock_basic()` 获取上市日期（Tushare 优势：静态数据准确）。
-3. 利用 `Pandas` 进行 Inner Join，并执行过滤规则（上市 > 1年，非退市整理期）。
+1. 调用 `ak.stock_zh_a_spot_em()` 获取全A股票基础清单（代码、名称）。
+2. 调用 `ak.stock_zh_a_st_em()` 获取 ST 标签列表。
+3. 利用 `Pandas` 做标准化（代码补齐、去重、名称兜底）并合并 ST 标签。
+4. 在线建池失败时读取 `POOL_CACHE_PATH`，在 `POOL_CACHE_TTL_HOURS` 内回退运行。
 
 ### 4.3 模块 C：抗网络抖动的数据采集 (Robust Fetcher)
 
@@ -206,16 +198,17 @@ df = get_ticks('600xxx.XSHG', start_dt='2024-01-01 13:00:00', end_dt='2024-01-01
 本地 WSL2 环境仅用于实盘阶段。
 
 * 数据来源: 东方财富 HTTP 接口 (EastMoney)。
+* 调度逻辑:
+* 北京时间 09:26：先做交易日判断，再对全市场做一字跌停统计并发送摘要（0 只也发送）。
+* 北京时间 13:00-15:00：仅对 09:26 统计出的名单轮询监控。
 * 监控逻辑:
-* 严格一字板过滤: 在每一轮轮询中，必须校验 `high_price` (最高价)。只有满足 `current_price == limit_down_price` 且 `high_price == limit_down_price` 的股票才是有效监控对象。
-* 动态剔除: 如果某只股票盘中 `high_price limit_down_price`（说明今日已经开过板，非一字），即使当前价格跌停，也应立即从监控池中移除。
-* 异动判定: 仅监控 Sell 1 (卖一) 封单量的变化。
-* 核心逻辑：`当前封单量 < 初始封单量 * (1 - 阈值)`。
-* 目标：捕捉封单被大单吃掉的过程。
+* 一字门禁：`current_price == limit_down_price` 且 `high_price == limit_down_price` 才参与策略判定。
+* 动态剔除：盘中若 `high_price > limit_down_price`，立即移除监控。
+* 异动判定：`buy_flow_breakout` 与 `sell1_drop` 双规则 OR。
 * 数据流转:
-* Tushare/AkShare: 每日 09:00 初始化股票池。
-* EastMoney API: 每日 13:00 - 15:00 轮询实时快照，数据在内存中处理完毕后即释放。
-* 状态清洗: 每次获取快照时，若发现 high_price > limit_down_price，直接丢弃该数据，不进入策略计算。
+* AkShare + 本地缓存：每日建池（在线优先，失败回退缓存）。
+* EastMoney API：午盘窗口内轮询实时快照，数据内存处理后即释放。
+* 状态清洗：开板数据不进入后续策略判定。
 
 * 参数注入: 将在云端回测确定的参数（如阈值、时间窗口）写入本地 `.env` 配置文件。
 
@@ -224,8 +217,8 @@ df = get_ticks('600xxx.XSHG', start_dt='2024-01-01 13:00:00', end_dt='2024-01-01
 | 阶段 | 数据提供方 | 数据类型 | 作用 |
 | --- | --- | --- | --- |
 | 策略研发 (回测) | JoinQuant/RiceQuant | Historical Tick | 验证逻辑，确定参数，无需下载数据。 |
-| 实盘监控 (生产) | EastMoney (via Aiohttp) | Real-time Snapshot | 实时捕捉信号，发送钉钉通知。 |
-| 每日选股 | AkShare | Real-time List | 生成当日监控目标池。 |
+| 盘前统计 (生产) | AkShare + EastMoney | Trade Calendar + Snapshot | 判断交易日并在 09:26 统计一字跌停名单。 |
+| 午盘监控 (生产) | EastMoney (via Aiohttp) | Real-time Snapshot | 对名单实时捕捉信号并发送钉钉通知。 |
 
 ---
 
@@ -250,7 +243,6 @@ tenacity
 loguru
 apprise
 akshare
-tushare
 pandas
 python-dotenv
 ```

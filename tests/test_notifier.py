@@ -52,3 +52,19 @@ def test_notification_includes_keyword(monkeypatch) -> None:
     assert DummyApprise.last_instance is not None
     assert DummyApprise.last_instance.last_body is not None
     assert DummyApprise.last_instance.last_body.startswith("【翘板提醒】")
+
+
+def test_send_text(monkeypatch) -> None:
+    fake_module = types.SimpleNamespace(Apprise=DummyApprise)
+    monkeypatch.setitem(sys.modules, "apprise", fake_module)
+
+    gateway = NotificationGateway(
+        dingtalk_url="https://oapi.dingtalk.com/robot/send?access_token=dummy",
+        keyword="【翘板提醒】",
+    )
+    ok = gateway.send_text(title="【服务状态】", body="状态: 正常")
+
+    assert ok is True
+    assert DummyApprise.last_instance is not None
+    assert DummyApprise.last_instance.last_title == "【服务状态】"
+    assert "状态: 正常" in (DummyApprise.last_instance.last_body or "")

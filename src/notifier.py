@@ -25,16 +25,20 @@ class NotificationGateway:
 
     def send_alert(self, event: AlertEvent) -> bool:
         """Send one alert event and return whether delivery succeeded."""
+        return self.send_text(title="Gutao_Chaodi Alert", body=event.format_message(), code=event.code)
+
+    def send_text(self, title: str, body: str, code: str = "-") -> bool:
+        """Send a plain text message with keyword prefix."""
         if not self.app:
             logger.error("notification gateway unavailable")
             return False
 
-        body = f"{self.keyword}\n{event.format_message()}"
+        wrapped_body = f"{self.keyword}\n{body}"
         try:
-            ok = self.app.notify(title="Gutao_Chaodi Alert", body=body)
+            ok = self.app.notify(title=title, body=wrapped_body)
             if not ok:
-                logger.error("notification send failed for {}", event.code)
+                logger.error("notification send failed for {}", code)
             return bool(ok)
         except Exception as exc:
-            logger.exception("notification exception for {}: {}", event.code, exc)
+            logger.exception("notification exception for {}: {}", code, exc)
             return False

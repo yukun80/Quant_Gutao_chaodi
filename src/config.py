@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from functools import lru_cache
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,7 +16,6 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    TUSHARE_TOKEN: str
     DINGTALK_URL: str
     DINGTALK_KEYWORD: str = "【翘板提醒】"
 
@@ -36,6 +37,13 @@ class Settings(BaseSettings):
 
     MONITOR_START_TIME: str = "13:00"
     MONITOR_END_TIME: str = "15:00"
+    PREOPEN_SCAN_TIME: str = "09:26"
+    TRADING_TIMEZONE: str = "Asia/Shanghai"
+    PREOPEN_MESSAGE_MAX_ROWS_PER_CHUNK: int = Field(default=80)
+    POOL_PROVIDER: str = "akshare"
+    POOL_CACHE_PATH: str = "data/pool_cache/latest_pool.csv"
+    POOL_CACHE_TTL_HOURS: int = Field(default=36)
+    POOL_FAILOVER_MODE: str = "cache"
 
     EM_API_BASE: str = "https://push2.eastmoney.com/api/qt/stock/get"
     EM_FIELDS: str = "f57,f58,f2,f15,f51,f31,f47"
@@ -64,12 +72,13 @@ class Settings(BaseSettings):
             raise ValueError("VOL_DROP_THRESHOLD must be in (0, 1)")
         return value
 
-    @field_validator("ASK_DROP_THRESHOLD")
+    @field_validator("ASK_DROP_THRESHOLD", mode="before")
     @classmethod
-    def validate_ask_drop_threshold(cls, value: float | None) -> float | None:
+    def validate_ask_drop_threshold(cls, value: Any) -> float | None:
         """Validate optional ask-drop threshold override."""
-        if value is None:
+        if value in (None, ""):
             return None
+        value = float(value)
         if not 0 < value < 1:
             raise ValueError("ASK_DROP_THRESHOLD must be in (0, 1)")
         return value
@@ -112,6 +121,14 @@ class Settings(BaseSettings):
         """Require a positive consecutive confirmation count."""
         if value <= 0 or value > 20:
             raise ValueError("CONFIRM_MINUTES must be in [1, 20]")
+        return value
+
+    @field_validator("PREOPEN_MESSAGE_MAX_ROWS_PER_CHUNK")
+    @classmethod
+    def validate_positive_seconds(cls, value: int) -> int:
+        """Pre-open summary chunk size must be positive."""
+        if value <= 0:
+            raise ValueError("PREOPEN_MESSAGE_MAX_ROWS_PER_CHUNK must be > 0")
         return value
 
     @field_validator("SIGNAL_COMBINATION", "BACKTEST_SIGNAL_COMBINATION")
@@ -163,7 +180,13 @@ class Settings(BaseSettings):
             raise ValueError("BACKTEST_SOURCE only supports 'joinquant' now")
         return normalized
 
-    @field_validator("BACKTEST_WINDOW_START", "BACKTEST_WINDOW_END", "MONITOR_START_TIME", "MONITOR_END_TIME")
+    @field_validator(
+        "BACKTEST_WINDOW_START",
+        "BACKTEST_WINDOW_END",
+        "MONITOR_START_TIME",
+        "MONITOR_END_TIME",
+        "PREOPEN_SCAN_TIME",
+    )
     @classmethod
     def validate_hhmm(cls, value: str | None) -> str | None:
         """Validate configured HH:MM time strings when present."""
@@ -182,6 +205,54 @@ class Settings(BaseSettings):
         normalized = value.strip()
         if not normalized:
             raise ValueError("DINGTALK_KEYWORD must not be empty")
+        return normalized
+
+    @field_validator("POOL_PROVIDER")
+    @classmethod
+    def validate_pool_provider(cls, value: str) -> str:
+        """Validate the configured live stock-pool provider."""
+        normalized = value.strip().lower()
+        if normalized not in {"akshare"}:
+            raise ValueError("POOL_PROVIDER only supports 'akshare' now")
+        return normalized
+
+    @field_validator("POOL_FAILOVER_MODE")
+    @classmethod
+    def validate_pool_failover_mode(cls, value: str) -> str:
+        """Validate online-pool failure handling mode."""
+        normalized = value.strip().lower()
+        if normalized not in {"cache", "fail_fast"}:
+            raise ValueError("POOL_FAILOVER_MODE must be 'cache' or 'fail_fast'")
+        return normalized
+
+    @field_validator("POOL_CACHE_PATH")
+    @classmethod
+    def validate_pool_cache_path(cls, value: str) -> str:
+        """Cache file path must be non-empty."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("POOL_CACHE_PATH must not be empty")
+        return normalized
+
+    @field_validator("POOL_CACHE_TTL_HOURS")
+    @classmethod
+    def validate_pool_cache_ttl_hours(cls, value: int) -> int:
+        """Pool cache ttl must be positive."""
+        if value <= 0:
+            raise ValueError("POOL_CACHE_TTL_HOURS must be > 0")
+        return value
+
+    @field_validator("TRADING_TIMEZONE")
+    @classmethod
+    def validate_trading_timezone(cls, value: str) -> str:
+        """Timezone must be a valid IANA zone name."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("TRADING_TIMEZONE must not be empty")
+        try:
+            ZoneInfo(normalized)
+        except Exception as exc:  # pragma: no cover - platform tz db issues
+            raise ValueError(f"invalid TRADING_TIMEZONE: {normalized}") from exc
         return normalized
 
 

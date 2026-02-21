@@ -1,6 +1,6 @@
 # Gutao_Chaodi
 
-A-share afternoon limit-down anomaly monitor for all listed A-share symbols.
+A-share one-word limit-down monitor with DingTalk webhook notifications.
 
 ## Quick start
 
@@ -19,11 +19,18 @@ cp .env.example .env
 # fill tokens/passwords in .env (do not write real secrets into .env.example)
 ```
 
+Live pool build now uses AkShare only (no Tushare token required).  
+If AkShare is temporarily unavailable, runtime can fall back to local cache via `POOL_FAILOVER_MODE=cache`.
+
 3. Run:
 
 ```bash
 bash scripts/run_live.sh
 ```
+
+This starts one unified process:
+- Trading-day check + 09:26 one-word limit-down summary push
+- Live monitor scheduler (13:00-15:00 by default, only monitors symbols selected at 09:26)
 
 ## Test
 

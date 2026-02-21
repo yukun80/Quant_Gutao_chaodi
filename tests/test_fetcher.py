@@ -10,7 +10,6 @@ from src.fetcher import EastMoneyFetcher
 
 def test_fetcher_accepts_optional_headers_and_cookie() -> None:
     settings = Settings(
-        TUSHARE_TOKEN="token",
         DINGTALK_URL="https://oapi.dingtalk.com/robot/send?access_token=dummy",
         EM_HEADERS_JSON='{"User-Agent":"gutao-test","X-Env":"dev"}',
         EM_COOKIE="a=1; b=2",
@@ -23,7 +22,6 @@ def test_fetcher_accepts_optional_headers_and_cookie() -> None:
 
 def test_fetcher_rejects_invalid_header_json() -> None:
     settings = Settings(
-        TUSHARE_TOKEN="token",
         DINGTALK_URL="https://oapi.dingtalk.com/robot/send?access_token=dummy",
         EM_HEADERS_JSON="{bad",
     )

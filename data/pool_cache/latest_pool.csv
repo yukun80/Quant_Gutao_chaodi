@@ -1,0 +1,4 @@
+code,name,is_st,pool_type,built_at
+000001,平安银行,False,all,2026-02-21T00:34:30
+000002,ST新例,True,all,2026-02-21T00:34:30
+000003,*ST退市风险,True,all,2026-02-21T00:34:30

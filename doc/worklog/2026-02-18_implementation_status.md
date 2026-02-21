@@ -1,5 +1,8 @@
 # Gutao_Chaodi 开发日志（对照 `doc/Development_White_Paper.md`）
 
+> 历史快照说明：本文记录的是 2026-02-18 当日阶段状态。  
+> 当前最新状态请以 `doc/worklog/2026-02-20_current_framework_status.md` 为准。
+
 - 日期：2026-02-18
 - 范围：本次已落地代码（`src/`、`tests/`、`scripts/`）
 - 对照基线：`doc/Development_White_Paper.md`
@@ -41,7 +44,7 @@
 ## 2. 部分完成项
 
 ### 2.1 模块 B：股票池构建（4.2）
-- 已完成 AkShare + Tushare 数据接入与池构建框架：`src/pool_manager.py`
+- 已完成 AkShare 在线建池 + 本地缓存回退框架：`src/pool_manager.py`
 - 已根据最新业务修订实现全市场入池：
   - 非ST、ST 均纳入监控池
   - ST 仅作为标签，不参与自动过滤
@@ -65,7 +68,7 @@
 - `VOL_DROP_THRESHOLD` 当前为配置注入，未建立“参数来自云端验证结论”的自动闭环。
 
 ### 3.2 生产运行保障增强
-- 未实现交易日自动调度（当前为手动启动模式）。
+- 当日未实现交易日自动调度（该项已在 2026-02-21 版本落地）。
 - 未实现进程守护/重启策略（systemd、supervisor、容器编排均未接入）。
 - 未实现显式 GC 调优与长期稳定性压测报告（白皮书高可用目标中的内存稳定部分）。
 
@@ -88,8 +91,9 @@
 - 增加轮询级别指标统计与健康检查。
 
 4. 补齐集成测试：
-- 加入 EastMoney/Tushare/AkShare 的接口契约测试与失败场景回放。
+- 加入 EastMoney/AkShare 的接口契约测试与失败场景回放。
 
 ## 5. 备注
 - 本次实现遵循最新业务口径：全市场股票入池，盘中命中一字跌停条件才进入策略判定。
 - ST 相关风险不自动剔除，交由人工核验。
+- 历史说明：本日志对应阶段实现；当前数据源现状请以 `doc/Project_Architecture_Guide.md` 与 `doc/Project_Memory.md` 为准。

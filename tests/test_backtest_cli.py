@@ -23,7 +23,6 @@ class ErrorProvider:
 
 
 def _seed_required_env(monkeypatch) -> None:
-    monkeypatch.setenv("TUSHARE_TOKEN", "token")
     monkeypatch.setenv("DINGTALK_URL", "https://oapi.dingtalk.com/robot/send?access_token=dummy")
     monkeypatch.setenv("JQ_USERNAME", "jq_user")
     monkeypatch.setenv("JQ_PASSWORD", "jq_password")
